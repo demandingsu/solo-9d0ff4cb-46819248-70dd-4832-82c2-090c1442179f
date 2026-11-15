@@ -4,7 +4,11 @@
 **同一次出没**的照片传递归组，按组稳定划分训练/验证索引，每批新增照片发布一个
 **不可变版本**（两份可下载索引 + 版本号）。
 
-技术栈：FastAPI + SQLite（WAL），单容器即可运行。
+交付训练数据前，研究员还可在网页选择某个**已发布版本**并上传 JPEG 原图 ZIP，
+服务按该版本冻结的两份索引逐条核对，报告缺图、包内同路径重复、无法解码及
+不同照片号对应相同图片字节的记录；全部通过才标记**可交付**。
+
+技术栈：FastAPI + SQLite（WAL）+ Pillow（JPEG 校验），单容器即可运行。
 
 ## 快速开始
 
@@ -28,6 +32,58 @@ docker compose up --build
 
 任意时刻打开 v1 的下载链接，内容保持最初发布时的原样（版本不可变）。
 首页「版本历史」可进入每个版本查看分组明细，「批次记录」查看每批的处理结果与拒绝原因。
+
+## 交付前 ZIP 原图审核
+
+首页「JPEG 原图 ZIP 审核」卡片选择版本并上传 ZIP（条目顺序任意）。服务按所选版本
+**冻结的两份索引**中的 `rel_path` 在包内逐条查找——不按文件名排序、也不做"解压覆盖"
+式匹配，同路径的每个条目都单独记录。报告四类问题：
+
+| 问题 | 判定 |
+|---|---|
+| 缺图 `missing` | 索引要求的 `rel_path` 在包内不存在 |
+| 同路径重复 `duplicate` | 同一 `rel_path` 在包内出现多次（列出每次出现的序号、大小、sha256） |
+| 无法解码 `undecodable` | 条目存在但 Pillow 无法按 JPEG 解码（含 PNG 等错误格式、截断文件） |
+| 字节碰撞 `byte_collision` | 不同 `photo_no` 对应的图片字节 sha256 完全相同 |
+
+四类问题**全部为空**才标记**可交付**；包内多余文件（索引未要求）只统计、不影响结论。
+
+**整次审核失败（不保留部分报告）**的情形：
+
+- 累计**解压字节数**超过 200MB（流式累计，防 ZIP 炸弹；压缩体积上限单独为 250MB）；
+- 条目路径不安全：绝对路径、`..` 穿越、盘符/反斜杠、空字节、符号链接/设备条目；
+- 压缩包损坏：无法打开、条目读取失败、CRC 校验失败等。
+
+失败时只在审核记录里留失败原因，不写报告文件、不展示任何问题明细。审核全程
+**不向磁盘解压**，上传的 ZIP 处理完即从临时目录删除。
+
+### 审核的一致性保证
+
+- **绑定版本与 ZIP 摘要**：每条审核记录与报告 JSON 都记录 `version_id` 和 ZIP 原始
+  字节的 sha256；新批次发布后再选旧版核对，仍读取该版本冻结的索引 CSV，与当前
+  `photos` 表状态无关。
+- **原子落库**：审核记录先以 `aborted` 占位插入同一事务，报告 JSON 先写临时文件再
+  `rename` 原子生效，最后事务提交；写库/写文件任一步失败整体回滚并清理孤儿文件，
+  页面不会出现半份结果。
+- 原有的 CSV 上传、版本发布、索引下载行为完全不变。
+
+### 浏览器演示：缺图与重名
+
+`samples/demo_*.zip` 已随仓库提供（由 `scripts/make_demo_zips.py` 生成，可重跑覆盖）。
+先上传 `batch1_base.csv` 发布 v1，再在审核卡片选择 v1 依次上传：
+
+| ZIP | 预期审核结果 |
+|---|---|
+| `demo_good.zip` | 6 张 JPEG 齐全可解码 → 通过、**可交付** |
+| `demo_missing.zip` | 缺 `P0004.jpg`（+1 个多余文件）→ 不可交付，报告缺图 |
+| `demo_dupname.zip` | `P0002.jpg` 包内出现两次、字节不同 → 不可交付，报告同路径重复 |
+| `demo_bad_all.zip` | 缺图 + 同路径重复 + 无法解码 + 字节碰撞各一条 → 不可交付 |
+
+重新生成演示 ZIP：
+
+```bash
+PYTHONPATH=. python3 scripts/make_demo_zips.py
+```
 
 ## CSV 格式
 
@@ -68,7 +124,7 @@ P0002,CAM01,2026-03-01T08:00:00Z,wild_boar,cam01/20260301/P0002.jpg
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest tests/ -q          # 15 个测试：归组逻辑 + 端到端（含并发、发布失败回滚）
+python -m pytest tests/ -q          # 52 个测试：归组逻辑 + 版本端到端 + ZIP 审核
 DATA_DIR=./data SAMPLES_DIR=./samples uvicorn app.main:app --reload
 ```
 
@@ -76,20 +132,25 @@ DATA_DIR=./data SAMPLES_DIR=./samples uvicorn app.main:app --reload
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DATA_DIR` | `./data`（容器内 `/data`） | SQLite 与版本索引存放目录 |
-| `SAMPLES_DIR` | `./samples` | 样例 CSV 目录（存在时首页显示演示入口） |
+| `DATA_DIR` | `./data`（容器内 `/data`） | SQLite、版本索引与审核报告存放目录 |
+| `SAMPLES_DIR` | `./samples` | 样例 CSV/ZIP 目录（存在时首页显示演示入口） |
 | `VAL_PERCENT` | `20` | 验证集目标比例（按组分桶） |
 | `GAP_SECONDS` | `60` | 同相机相邻照片归组阈值（秒） |
 | `SPLIT_SALT` | `wildlife-trap-v1` | 划分哈希盐；改盐整体重排训练/验证划分 |
+| `MAX_UNCOMPRESSED_BYTES` | `209715200`（200MB） | ZIP 累计解压量硬上限，超过即整次审核失败 |
+| `MAX_ZIP_UPLOAD_BYTES` | `262144000`（250MB） | ZIP 上传压缩体积上限 |
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 应用：上传、版本发布、页面、下载（含事务与落盘逻辑）
+  main.py        # FastAPI 应用：CSV 上传、版本发布、ZIP 审核、页面、下载
   grouping.py    # 归组与稳定划分（纯函数，可单测）
-samples/         # 跨批补传演示的四个样例 CSV
-tests/           # 单元测试 + 端到端测试
+  audit.py       # ZIP 扫描与四类问题判定（纯内存，不解压到磁盘）
+scripts/
+  make_demo_zips.py  # 生成浏览器演示用的 demo_*.zip
+samples/         # 四个样例 CSV + 四个演示 ZIP
+tests/           # 单元测试 + 端到端测试（含损坏包/不安全路径/ZIP 炸弹）
 Dockerfile
 docker-compose.yml
 ```

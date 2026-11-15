@@ -10,11 +10,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY samples ./samples
+COPY scripts ./scripts
 
 ENV DATA_DIR=/data \
     SAMPLES_DIR=/srv/app/samples \
     VAL_PERCENT=20 \
-    GAP_SECONDS=60
+    GAP_SECONDS=60 \
+    MAX_UNCOMPRESSED_BYTES=209715200 \
+    MAX_ZIP_UPLOAD_BYTES=262144000
 
 VOLUME ["/data"]
 EXPOSE 8000

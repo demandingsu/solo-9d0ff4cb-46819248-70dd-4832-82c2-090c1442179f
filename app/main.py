@@ -15,10 +15,13 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
 import os
 import shutil
 import sqlite3
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,20 +29,33 @@ from html import escape
 from pathlib import Path
 from urllib.parse import urlencode
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 
+from .audit import (
+    DEFAULT_MAX_UNCOMPRESSED_BYTES,
+    AuditAborted,
+    ExpectedPhoto,
+    audit_zip,
+)
 from .grouping import Photo, assign_split, compute_groups
 
 REQUIRED_COLUMNS = ("photo_no", "camera_no", "captured_at", "species", "rel_path")
 INDEX_COLUMNS = ("photo_no", "camera_no", "captured_at", "species", "rel_path", "group_id")
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_ZIP_UPLOAD_BYTES = 250 * 1024 * 1024  # ZIP 上传压缩体积上限（解压量另有 200MB 硬上限）
 
 STATUS_LABELS = {
     "applied": "已发布",
     "noop": "无变化",
     "rejected": "已拒绝",
     "failed": "发布失败",
+}
+
+AUDIT_STATUS_LABELS = {
+    "passed": "通过",
+    "issues": "发现问题",
+    "aborted": "审核失败",
 }
 
 
@@ -52,6 +68,8 @@ class Settings:
     gap_seconds: int = 60
     split_salt: str = "wildlife-trap-v1"
     samples_dir: Path | None = None
+    max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES
+    max_zip_upload_bytes: int = MAX_ZIP_UPLOAD_BYTES
 
     @property
     def db_path(self) -> Path:
@@ -60,6 +78,10 @@ class Settings:
     @property
     def versions_dir(self) -> Path:
         return self.data_dir / "versions"
+
+    @property
+    def audits_dir(self) -> Path:
+        return self.data_dir / "audits"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -71,6 +93,12 @@ class Settings:
             gap_seconds=int(os.environ.get("GAP_SECONDS", "60")),
             split_salt=os.environ.get("SPLIT_SALT", "wildlife-trap-v1"),
             samples_dir=samples_dir if samples_dir and samples_dir.is_dir() else None,
+            max_uncompressed_bytes=int(
+                os.environ.get("MAX_UNCOMPRESSED_BYTES", str(DEFAULT_MAX_UNCOMPRESSED_BYTES))
+            ),
+            max_zip_upload_bytes=int(
+                os.environ.get("MAX_ZIP_UPLOAD_BYTES", str(MAX_ZIP_UPLOAD_BYTES))
+            ),
         )
 
 
@@ -134,6 +162,26 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS audits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    audited_at TEXT NOT NULL,
+    version_id INTEGER NOT NULL REFERENCES versions(id),
+    zip_filename TEXT NOT NULL,
+    zip_sha256 TEXT NOT NULL,              -- 上传 ZIP 原始字节摘要，报告绑定该摘要
+    zip_size INTEGER NOT NULL,
+    status TEXT NOT NULL,                  -- passed | issues | aborted
+    deliverable INTEGER NOT NULL DEFAULT 0,
+    expected_count INTEGER NOT NULL DEFAULT 0,
+    entry_count INTEGER NOT NULL DEFAULT 0,
+    scanned_bytes INTEGER NOT NULL DEFAULT 0,
+    missing_count INTEGER NOT NULL DEFAULT 0,
+    duplicate_count INTEGER NOT NULL DEFAULT 0,
+    undecodable_count INTEGER NOT NULL DEFAULT 0,
+    collision_count INTEGER NOT NULL DEFAULT 0,
+    extra_count INTEGER NOT NULL DEFAULT 0,
+    abort_reason TEXT,
+    report_path TEXT NOT NULL DEFAULT ''
+);
 """
 
 
@@ -148,13 +196,17 @@ def connect(settings: Settings) -> sqlite3.Connection:
 
 def init_storage(settings: Settings) -> None:
     settings.versions_dir.mkdir(parents=True, exist_ok=True)
+    settings.audits_dir.mkdir(parents=True, exist_ok=True)
     conn = connect(settings)
     try:
         conn.executescript(SCHEMA)
     finally:
         conn.close()
-    # 清理上次进程崩溃可能遗留的临时目录（完整版本目录永不动）
+    # 清理上次进程崩溃可能遗留的临时目录（完整版本/报告目录永不动）
     for d in settings.versions_dir.iterdir():
+        if d.is_dir() and d.name.startswith(".tmp-"):
+            shutil.rmtree(d, ignore_errors=True)
+    for d in settings.audits_dir.iterdir():
         if d.is_dir() and d.name.startswith(".tmp-"):
             shutil.rmtree(d, ignore_errors=True)
 
@@ -408,6 +460,166 @@ def process_batch(settings: Settings, filename: str, rows: list[CsvRow]) -> tupl
         conn.close()
 
 
+# ---------------------------------------------------------------- ZIP 审核
+
+def load_version_expected(settings: Settings, vid: int) -> tuple[sqlite3.Row, list[ExpectedPhoto]]:
+    """从版本冻结的两份索引 CSV 加载期望照片（不查当前 photos 表，
+    保证"新批次发布后仍按所选旧版核对"）。"""
+    conn = connect(settings)
+    try:
+        v = conn.execute("SELECT * FROM versions WHERE id=?", (vid,)).fetchone()
+    finally:
+        conn.close()
+    if v is None:
+        raise HTTPException(404, "版本不存在")
+
+    expected: list[ExpectedPhoto] = []
+    for split, col in (("train", "train_path"), ("val", "val_path")):
+        path = settings.data_dir / v[col]
+        if not path.is_file():
+            raise HTTPException(500, f"版本索引文件缺失: {v[col]}")
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                expected.append(ExpectedPhoto(row["photo_no"], row["rel_path"], split))
+    if not expected:
+        raise HTTPException(400, "该版本索引为空，无法审核")
+    return v, expected
+
+
+def _write_audit_report(audits_dir: Path, audit_id: int, report: dict) -> Path:
+    """报告先写临时目录再原子 rename：读者只能看到完整报告，不存在半份文件。"""
+    target = audits_dir / f"audit-{audit_id}.json"
+    tmp_dir = audits_dir / f".tmp-audit-{audit_id}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True)
+    tmp_file = tmp_dir / "report.json"
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.rename(tmp_file, target)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return target
+
+
+def run_audit(
+    settings: Settings,
+    vid: int,
+    zip_filename: str,
+    zip_path: Path,
+    zip_sha256: str,
+    zip_size: int,
+) -> int:
+    """执行一次审核并原子落库 + 落盘报告，返回 audits.id。
+
+    扫描失败（AuditAborted）只记录失败原因，findings 与报告内容都不保留；
+    任何写库/写文件失败整体回滚，页面上不会出现半份结果。
+    """
+    v, expected = load_version_expected(settings, vid)
+
+    base_report = {
+        "audit_id": None,
+        "version_id": vid,
+        "audited_at": utcnow_str(),
+        "zip_filename": zip_filename,
+        "zip_sha256": zip_sha256,
+        "zip_size": zip_size,
+        "index_summary": {
+            "photo_count": v["photo_count"],
+            "train_count": v["train_count"],
+            "val_count": v["val_count"],
+            "expected_count": len(expected),
+        },
+        "max_uncompressed_bytes": settings.max_uncompressed_bytes,
+    }
+
+    conn = connect(settings)
+    audit_id: int | None = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "INSERT INTO audits(audited_at, version_id, zip_filename, zip_sha256, zip_size, status)"
+            " VALUES (?,?,?,?,?,?)",
+            (base_report["audited_at"], vid, zip_filename, zip_sha256, zip_size, "aborted"),
+        )
+        audit_id = int(cur.lastrowid)
+
+        try:
+            result = audit_zip(str(zip_path), expected, settings.max_uncompressed_bytes)
+        except AuditAborted as exc:
+            # 整次审核失败：只留失败原因，不写任何 findings/报告文件
+            conn.execute(
+                "UPDATE audits SET status='aborted', deliverable=0, expected_count=?,"
+                " abort_reason=? WHERE id=?",
+                (len(expected), str(exc)[:500], audit_id),
+            )
+            conn.execute("COMMIT")
+            return audit_id
+
+        findings = result.find()
+        counts = {key: len(items) for key, items in findings.items()}
+        deliverable = not any(counts.values())
+        status = "passed" if deliverable else "issues"
+
+        report = dict(base_report)
+        report["audit_id"] = audit_id
+        report.update({
+            "status": status,
+            "deliverable": deliverable,
+            "entry_count": result.entry_count,
+            "scanned_bytes": result.scanned_bytes,
+            "counts": {
+                "missing": counts["missing"],
+                "duplicate": counts["duplicate"],
+                "undecodable": counts["undecodable"],
+                "byte_collision": counts["byte_collision"],
+                "extra_files": len(result.extra_files),
+            },
+            "findings": findings,
+            "extra_files": sorted(result.extra_files),
+        })
+
+        # 先在事务内写报告文件（tmp+rename），失败则整体回滚，库里不留半截记录
+        report_path = _write_audit_report(settings.audits_dir, audit_id, report)
+        conn.execute(
+            "UPDATE audits SET status=?, deliverable=?, expected_count=?, entry_count=?,"
+            " scanned_bytes=?, missing_count=?, duplicate_count=?, undecodable_count=?,"
+            " collision_count=?, extra_count=?, report_path=? WHERE id=?",
+            (
+                status,
+                1 if deliverable else 0,
+                len(expected),
+                result.entry_count,
+                result.scanned_bytes,
+                counts["missing"],
+                counts["duplicate"],
+                counts["undecodable"],
+                counts["byte_collision"],
+                len(result.extra_files),
+                str(Path("audits") / f"audit-{audit_id}.json"),
+                audit_id,
+            ),
+        )
+        conn.execute("COMMIT")
+        return audit_id
+
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        if audit_id is not None:
+            # 回滚后可能残留的孤儿报告文件安全清理
+            orphan = settings.audits_dir / f"audit-{audit_id}.json"
+            orphan.unlink(missing_ok=True)
+        raise
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------- 页面渲染
 
 PAGE_CSS = """
@@ -491,8 +703,12 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
     samples_html = ""
     if settings.samples_dir:
         files = sorted(p.name for p in settings.samples_dir.glob("*.csv"))
+        zip_files = sorted(p.name for p in settings.samples_dir.glob("*.zip"))
         if files:
             links = " ".join(f'<li><a href="/samples/{escape(n)}">{escape(n)}</a></li>' for n in files)
+            zip_links = " ".join(
+                f'<li><a href="/samples/{escape(n)}">{escape(n)}</a></li>' for n in zip_files
+            )
             samples_html = f"""
 <div class="card"><h2 style="margin-top:0">跨批补传演示（浏览器可操作）</h2>
 <ol class="steps">
@@ -503,7 +719,17 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
 <li>上传 <code>batch3_duplicate.csv</code>（与 batch2 完全相同）→ 不产生新版本。</li>
 <li>上传 <code>batch4_conflict.csv</code>（P0001 内容被改动）→ 整批拒绝，现役版本保持 v2。</li>
 <li>随时打开 v1 的下载链接，内容保持最初发布时的原样。</li>
-</ol></div>"""
+</ol></div>
+<div class="card"><h2 style="margin-top:0">ZIP 原图审核演示（基于 v1 索引）</h2>
+<p class="muted">先上传 <code>batch1_base.csv</code> 发布 v1，再在上方「JPEG 原图 ZIP 审核」选择版本 v1 并依次上传：</p>
+<ol class="steps">
+<li>下载演示 ZIP：<ul>{zip_links}</ul></li>
+<li><code>demo_good.zip</code> → 四类问题全空，<strong>通过、可交付</strong>。</li>
+<li><code>demo_missing.zip</code> → 报告 1 条<strong>缺图</strong>（另含 1 个包内多余文件，仅统计不影响结论）。</li>
+<li><code>demo_dupname.zip</code> → <code>P0002.jpg</code> 在包内出现两次，报告<strong>同路径重复</strong>。</li>
+<li><code>demo_bad_all.zip</code> → 同时报告缺图、同路径重复、无法解码、不同照片号字节碰撞，<strong>不可交付</strong>。</li>
+</ol>
+<p class="muted">ZIP 内条目顺序已刻意打乱，审核不依赖文件名排序或解压覆盖结果。</p></div>"""
 
     # 版本表
     if versions:
@@ -544,7 +770,17 @@ def home_page(settings: Settings, msg: str, kind: str) -> str:
     else:
         batches_html = ""
 
-    return page("首页", flash_html(msg, kind) + banner + upload + samples_html + versions_html + batches_html)
+    return page(
+        "首页",
+        flash_html(msg, kind)
+        + banner
+        + upload
+        + audit_card(versions, active_id)
+        + audit_history_card(settings)
+        + samples_html
+        + versions_html
+        + batches_html,
+    )
 
 
 def version_detail_page(settings: Settings, vid: int) -> str:
@@ -552,6 +788,9 @@ def version_detail_page(settings: Settings, vid: int) -> str:
     try:
         v = conn.execute("SELECT * FROM versions WHERE id=?", (vid,)).fetchone()
         active_id = get_active_version(conn)
+        recent_audits = conn.execute(
+            "SELECT * FROM audits WHERE version_id=? ORDER BY id DESC LIMIT 5", (vid,)
+        ).fetchall()
     finally:
         conn.close()
     if v is None:
@@ -580,6 +819,24 @@ def version_detail_page(settings: Settings, vid: int) -> str:
         )
 
     active_badge = ' <span class="badge">现役</span>' if vid == active_id else ""
+    if recent_audits:
+        arows = []
+        for a in recent_audits:
+            label = AUDIT_STATUS_LABELS.get(a["status"], a["status"])
+            mark = "✅ 可交付" if a["deliverable"] else ("⛔ 不可交付" if a["status"] != "aborted" else "整次失败")
+            arows.append(
+                f'<tr><td><a href="/audits/{a["id"]}">#{a["id"]}</a></td><td>{a["audited_at"]}</td>'
+                f"<td>{escape(a['zip_filename'])}</td><td><code>{a['zip_sha256'][:12]}…</code></td>"
+                f"<td>{label}</td><td>{mark}</td></tr>"
+            )
+        audits_html = (
+            '<div class="card"><h2 style="margin-top:0">本版本最近 ZIP 审核</h2>'
+            "<table><tr><th>审核</th><th>时间(UTC)</th><th>ZIP</th><th>摘要</th><th>状态</th><th>结论</th></tr>"
+            + "".join(arows)
+            + "</table></div>"
+        )
+    else:
+        audits_html = ""
     body = f"""
 <div class="card"><h2 style="margin-top:0">版本 v{vid}{active_badge}</h2>
 <p>发布于 {v['created_at']} UTC · 照片 {v['photo_count']} 张 · 组 {v['group_count']} 个 ·
@@ -587,6 +844,7 @@ def version_detail_page(settings: Settings, vid: int) -> str:
 <p><a class="btn" href="/versions/{vid}/files/train_index.csv">下载训练索引</a>
 <a class="btn" href="/versions/{vid}/files/val_index.csv">下载验证索引</a>
 <a class="btn secondary" href="/">返回首页</a></p></div>
+{audits_html}
 <div class="card"><h2 style="margin-top:0">出没事件分组（group_id = 组内最早照片号）</h2>
 <table><tr><th>group_id</th><th>相机</th><th>开始(UTC)</th><th>结束(UTC)</th><th>张数</th><th>划分</th><th>成员照片</th></tr>
 {''.join(grows)}</table></div>"""
@@ -637,6 +895,179 @@ def batch_detail_page(settings: Settings, bid: int) -> str:
 <p><a class="btn secondary" href="/">返回首页</a></p></div>
 {photos_html}"""
     return page(f"批次 #{bid}", body)
+
+
+def audit_card(versions, active_id) -> str:
+    """首页的 ZIP 审核表单 + 审核说明。"""
+    if not versions:
+        return ""
+    options = "".join(
+        f'<option value="{v["id"]}"'
+        + (" selected" if v["id"] == active_id else "")
+        + f">v{v['id']}（{v['photo_count']} 张，发布于 {v['created_at']}）</option>"
+        for v in versions
+    )
+    return f"""
+<div class="card"><h2 style="margin-top:0">JPEG 原图 ZIP 审核（交付前核对）</h2>
+<form action="/audits" method="post" enctype="multipart/form-data">
+<p><label>选择已发布版本：<select name="version_id">{options}</select></label></p>
+<p><input type="file" name="file" accept=".zip,application/zip,application/x-zip-compressed" required>
+<button class="btn" type="submit">上传 ZIP 并审核</button></p>
+</form>
+<p class="muted">按所选版本<strong>冻结的两份索引</strong>中的 <code>rel_path</code> 在包内逐条查找
+（条目顺序任意，不按文件名或解压覆盖结果匹配），报告：缺图、包内同路径重复、
+无法按 JPEG 解码、不同照片号对应相同图片字节（sha256）。四类问题全部为空才标记<strong>可交付</strong>。
+新批次发布不影响旧版核对。累计解压量超过 {DEFAULT_MAX_UNCOMPRESSED_BYTES // (1024 * 1024)}MB、
+路径不安全或压缩包损坏时整次审核失败，不保留部分报告。</p></div>"""
+
+
+def audit_history_card(settings: Settings) -> str:
+    conn = connect(settings)
+    try:
+        audits = conn.execute("SELECT * FROM audits ORDER BY id DESC LIMIT 30").fetchall()
+    finally:
+        conn.close()
+    if not audits:
+        return ""
+    rows = []
+    for a in audits:
+        label = AUDIT_STATUS_LABELS.get(a["status"], a["status"])
+        if a["status"] == "passed":
+            color = "#1d5c1d"
+        elif a["status"] == "issues":
+            color = "#8a6d1f"
+        else:
+            color = "#8a1f1f"
+        mark = "✅ 可交付" if a["deliverable"] else ("⛔ 不可交付" if a["status"] != "aborted" else "—")
+        rows.append(
+            f'<tr><td><a href="/audits/{a["id"]}">#{a["id"]}</a></td>'
+            f'<td><a href="/versions/{a["version_id"]}">v{a["version_id"]}</a></td>'
+            f"<td>{a['audited_at']}</td><td>{escape(a['zip_filename'])}</td>"
+            f"<td><code>{a['zip_sha256'][:12]}…</code></td>"
+            f'<td style="color:{color}">{label}</td><td>{mark}</td>'
+            f"<td>{a['missing_count']}/{a['duplicate_count']}/{a['undecodable_count']}/{a['collision_count']}</td></tr>"
+        )
+    return (
+        '<div class="card"><h2 style="margin-top:0">ZIP 审核记录（绑定版本与 ZIP 摘要）</h2>'
+        '<p class="muted">问题列依次为：缺图 / 同路径重复 / 无法解码 / 字节碰撞</p>'
+        "<table><tr><th>审核</th><th>版本</th><th>时间(UTC)</th><th>ZIP 文件</th><th>sha256</th>"
+        "<th>状态</th><th>交付结论</th><th>问题数</th></tr>" + "".join(rows) + "</table></div>"
+    )
+
+
+def audit_detail_page(settings: Settings, audit_id: int) -> str:
+    conn = connect(settings)
+    try:
+        a = conn.execute("SELECT * FROM audits WHERE id=?", (audit_id,)).fetchone()
+    finally:
+        conn.close()
+    if a is None:
+        raise HTTPException(404, "审核记录不存在")
+
+    label = AUDIT_STATUS_LABELS.get(a["status"], a["status"])
+    if a["status"] == "passed":
+        banner_cls = "flash-ok"
+        verdict = "✅ 四类问题全部为空，该版本与该 ZIP 核对通过，标记为<strong>可交付</strong>。"
+    elif a["status"] == "issues":
+        banner_cls = "flash-err"
+        verdict = "⛔ 存在问题，<strong>不可交付</strong>，请按下列明细修正后重新上传审核。"
+    else:
+        banner_cls = "flash-err"
+        verdict = "⛔ 整次审核失败，未生成审核结果（无部分报告）。"
+
+    head = f"""
+<div class="card"><h2 style="margin-top:0">ZIP 审核 #{a['id']} · <span class="badge">{label}</span></h2>
+<table>
+<tr><th>审核时间(UTC)</th><td>{a['audited_at']}</td></tr>
+<tr><th>绑定版本</th><td><a href="/versions/{a['version_id']}">v{a['version_id']}</a>（冻结索引，共 {a['expected_count']} 条）</td></tr>
+<tr><th>ZIP 文件名</th><td>{escape(a['zip_filename'])}</td></tr>
+<tr><th>ZIP 字节数</th><td>{a['zip_size']}</td></tr>
+<tr><th>ZIP sha256</th><td><code>{a['zip_sha256']}</code></td></tr>
+<tr><th>包内文件条目 / 累计解压字节</th><td>{a['entry_count']} / {a['scanned_bytes']}</td></tr>
+</table>
+<p><a class="btn" href="/versions/{a['version_id']}/files/train_index.csv">下载该版训练索引</a>
+<a class="btn" href="/versions/{a['version_id']}/files/val_index.csv">下载该版验证索引</a>
+<a class="btn secondary" href="/">返回首页</a></p></div>"""
+
+    if a["status"] == "aborted":
+        body = (
+            head
+            + f'<div class="flash {banner_cls}">{verdict}<br>失败原因：<code>{escape(a["abort_reason"] or "未知")}</code></div>'
+        )
+        return page(f"审核 #{audit_id}", body)
+
+    report_file = settings.data_dir / a["report_path"]
+    if not report_file.is_file():
+        raise HTTPException(500, "审核报告文件缺失")
+    with open(report_file, encoding="utf-8") as f:
+        report = json.load(f)
+
+    summary = f"""
+<div class="flash {banner_cls}">{verdict}</div>
+<div class="card"><h2 style="margin-top:0">问题汇总</h2>
+<table><tr><th>缺图</th><th>同路径重复</th><th>无法解码</th><th>字节碰撞</th><th>包内多余文件</th></tr>
+<tr><td>{a['missing_count']}</td><td>{a['duplicate_count']}</td><td>{a['undecodable_count']}</td>
+<td>{a['collision_count']}</td><td>{a['extra_count']}</td></tr></table>
+<p class="muted">报告 JSON（含全部明细，绑定版本 id 与 ZIP sha256）：
+<a href="/audits/{audit_id}/report">下载 report.json</a></p></div>"""
+
+    def rows_table(title: str, headers: list[str], rows_html: list[str]) -> str:
+        if not rows_html:
+            return f'<div class="card"><h2 style="margin-top:0">{title}</h2><p class="muted">无</p></div>'
+        return (
+            f'<div class="card"><h2 style="margin-top:0">{title}（{len(rows_html)}）</h2>'
+            "<table><tr>" + "".join(f"<th>{escape(h)}</th>" for h in headers) + "</tr>"
+            + "".join(rows_html) + "</table></div>"
+        )
+
+    findings = report["findings"]
+    missing_rows = [
+        f"<tr><td>{escape(i['rel_path'])}</td><td>{escape(', '.join(i['photo_nos']))}</td></tr>"
+        for i in findings["missing"]
+    ]
+    dup_rows = []
+    for i in findings["duplicate"]:
+        occ = "；".join(
+            f"第{o['ordinal']}条({o['size']}B, <code>{o['sha256'][:10]}…</code>)"
+            for o in i["occurrences"]
+        )
+        dup_rows.append(
+            f"<tr><td>{escape(i['rel_path'])}</td><td>{escape(', '.join(i['photo_nos']))}</td><td>{len(i['occurrences'])} 次：{occ}</td></tr>"
+        )
+    bad_rows = [
+        f"<tr><td>{escape(i['rel_path'])}</td><td>第 {i['ordinal']} 条</td><td>{i['size']} B</td>"
+        f"<td><code>{escape(i['reason'])}</code></td></tr>"
+        for i in findings["undecodable"]
+    ]
+    coll_rows = []
+    for i in findings["byte_collision"]:
+        files = "；".join(
+            f"{escape(x['rel_path'])}（第{x['ordinal']}条，照片号 {escape(', '.join(x['photo_nos']))}）"
+            for x in i["files"]
+        )
+        coll_rows.append(
+            f"<tr><td><code>{i['sha256']}</code></td><td>{escape(', '.join(i['photo_nos']))}</td><td>{files}</td></tr>"
+        )
+
+    extras = report.get("extra_files", [])
+    extras_html = rows_table(
+        "包内多余文件（索引未要求，不影响交付结论）",
+        ["rel_path"],
+        [f"<tr><td>{escape(p)}</td></tr>" for p in extras[:200]],
+    )
+    if len(extras) > 200:
+        extras_html += f'<p class="muted">仅显示前 200 条，共 {len(extras)} 条，完整列表见报告 JSON。</p>'
+
+    body = (
+        head
+        + summary
+        + rows_table("缺图（索引要求但包内不存在）", ["rel_path", "照片号"], missing_rows)
+        + rows_table("包内同路径重复", ["rel_path", "照片号", "出现明细"], dup_rows)
+        + rows_table("无法按 JPEG 解码", ["rel_path", "条目", "大小", "原因"], bad_rows)
+        + rows_table("不同照片号对应相同图片字节", ["sha256", "照片号", "涉及文件"], coll_rows)
+        + extras_html
+    )
+    return page(f"审核 #{audit_id}", body)
 
 
 # ---------------------------------------------------------------- 应用
@@ -698,6 +1129,85 @@ def create_app(settings: Settings) -> FastAPI:
     def batch_detail(bid: int) -> str:
         return batch_detail_page(settings, bid)
 
+    # -------------------------------- ZIP 原图审核
+    @app.post("/audits")
+    def create_audit(version_id: int = Form(...), file: UploadFile = File(...)):
+        conn = connect(settings)
+        try:
+            v = conn.execute("SELECT id FROM versions WHERE id=?", (version_id,)).fetchone()
+        finally:
+            conn.close()
+        if v is None:
+            return RedirectResponse(
+                "/?" + urlencode({"kind": "err", "msg": f"版本 v{version_id} 不存在，无法审核"}), 303
+            )
+
+        zip_filename = file.filename or "upload.zip"
+        # 上传内容先落到独立临时目录（每个 ZIP 一个空目录，处理完即删）
+        tmp_dir = Path(tempfile.mkdtemp(prefix="zip-audit-", dir=settings.data_dir))
+        tmp_zip = tmp_dir / "upload.zip"
+        hasher = hashlib.sha256()
+        total = 0
+        try:
+            with open(tmp_zip, "wb") as out:
+                while True:
+                    chunk = file.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > settings.max_zip_upload_bytes:
+                        return RedirectResponse(
+                            "/?"
+                            + urlencode(
+                                {"kind": "err", "msg": f"ZIP 超过 {settings.max_zip_upload_bytes // (1024 * 1024)}MB 上传限制"}
+                            ),
+                            303,
+                        )
+                    hasher.update(chunk)
+                    out.write(chunk)
+
+            try:
+                audit_id = run_audit(
+                    settings,
+                    version_id,
+                    zip_filename,
+                    tmp_zip,
+                    hasher.hexdigest(),
+                    total,
+                )
+            except Exception as exc:  # 写库/写报告失败：记录不留半份，回到首页报错
+                return RedirectResponse(
+                    "/?" + urlencode({"kind": "err", "msg": f"审核记录写入失败，未保留结果：{exc}"}), 303
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)  # 原上传 ZIP 处理完即删，不长期留存
+
+        return RedirectResponse(f"/audits/{audit_id}", status_code=303)
+
+    @app.get("/audits/{audit_id}", response_class=HTMLResponse)
+    def audit_detail(audit_id: int) -> str:
+        return audit_detail_page(settings, audit_id)
+
+    @app.get("/audits/{audit_id}/report")
+    def audit_report(audit_id: int):
+        conn = connect(settings)
+        try:
+            a = conn.execute("SELECT * FROM audits WHERE id=?", (audit_id,)).fetchone()
+        finally:
+            conn.close()
+        if a is None:
+            raise HTTPException(404, "审核记录不存在")
+        if a["status"] == "aborted" or not a["report_path"]:
+            raise HTTPException(404, "该次审核失败，不存在报告文件")
+        path = settings.data_dir / a["report_path"]
+        if not path.is_file():
+            raise HTTPException(404, "报告文件缺失")
+        return FileResponse(
+            path,
+            media_type="application/json",
+            filename=f"v{a['version_id']}_audit-{audit_id}_report.json",
+        )
+
     if settings.samples_dir:
         samples_root = settings.samples_dir
 
@@ -706,7 +1216,8 @@ def create_app(settings: Settings) -> FastAPI:
             path = (samples_root / name).resolve()
             if not path.is_file() or samples_root not in path.parents:
                 raise HTTPException(404, "样例不存在")
-            return FileResponse(path, media_type="text/csv", filename=name)
+            media = "application/zip" if name.endswith(".zip") else "text/csv"
+            return FileResponse(path, media_type=media, filename=name)
 
     @app.get("/healthz")
     def healthz() -> dict:

@@ -10,6 +10,8 @@ services:
       VAL_PERCENT: "20"      # 验证集目标比例（按组哈希分桶）
       GAP_SECONDS: "60"      # 同相机相邻照片归组阈值（秒）
       # SPLIT_SALT: wildlife-trap-v1   # 改盐可整体重排训练/验证划分
+      MAX_UNCOMPRESSED_BYTES: "209715200"  # ZIP 累计解压量硬上限 200MB
+      MAX_ZIP_UPLOAD_BYTES: "262144000"    # ZIP 上传体积上限 250MB
     volumes:
       - wildlife-data:/data   # SQLite 库与各版本索引文件，容器重建后数据仍在
     restart: unless-stopped
